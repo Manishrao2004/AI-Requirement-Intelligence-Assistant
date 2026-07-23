@@ -1,56 +1,87 @@
-"""LangGraph workflow — wires all 10 agents into a sequential analysis pipeline."""
+"""LangGraph workflow — 3-Agent linear pipeline.
+
+Architecture:
+    analysis_agent 
+        │
+        ▼
+    extract_analysis
+        │
+        ▼
+    validation_agent -> [validation_tools] -> validation_agent  (Tool loop)
+        |
+        v
+    synthesis_agent
+        |
+        v
+    format_output -> END
+
+Checkpointer: MemorySaver (in-process, per thread_id = job_id)
+"""
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+
 from app.state import AnalysisState
-from app.agents.requirement_extractor import extract_requirements
-from app.agents.user_story_generator import generate_user_stories
-from app.agents.stakeholder_detector import detect_stakeholders
-from app.agents.priority_classifier import classify_priorities
-from app.agents.ambiguity_checker import check_ambiguities
-from app.agents.missing_requirement_detector import detect_missing_requirements
-from app.agents.conflict_detector import detect_conflicts
-from app.agents.dependency_finder import find_dependencies
-from app.agents.summary_generator import generate_summary
-from app.agents.json_formatter import format_json
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from pymongo import MongoClient
-from app.config import MONGODB_URL
 
-# Synchronous client for LangGraph checkpointer (runs in to_thread)
-_mongo_client = MongoClient(MONGODB_URL)
-_checkpointer = MongoDBSaver(_mongo_client)
+# Agent 1 (Analysis / Extraction)
+from app.agents.analysis_agent import (
+    analysis_agent,
+    extract_analysis,
+)
 
+# Agent 2 (Validation / Tool Execution)
+from app.agents.validation_agent import (
+    validation_agent,
+    route_validation,
+    VALIDATION_TOOLS,
+)
 
-def build_analysis_graph() -> StateGraph:
-    """Build and compile the LangGraph analysis pipeline."""
+# Agent 3 (Synthesis / Output Formatting)
+from app.agents.synthesis_agent import (
+    synthesis_agent,
+    format_output,
+)
+
+# In-process memory checkpointer
+_checkpointer = MemorySaver()
+
+def build_analysis_graph():
+    """Build and compile the 3-agent LangGraph analysis pipeline."""
     graph = StateGraph(AnalysisState)
 
-    # Add all agent nodes
-    graph.add_node("extract_requirements", extract_requirements)
-    graph.add_node("detect_stakeholders", detect_stakeholders)
-    graph.add_node("generate_user_stories", generate_user_stories)
-    graph.add_node("classify_priorities", classify_priorities)
-    graph.add_node("check_ambiguities", check_ambiguities)
-    graph.add_node("detect_missing", detect_missing_requirements)
-    graph.add_node("detect_conflicts", detect_conflicts)
-    graph.add_node("find_dependencies", find_dependencies)
-    graph.add_node("generate_summary", generate_summary)
-    graph.add_node("format_json", format_json)
+    # Nodes
+    graph.add_node("analysis_agent", analysis_agent)
+    graph.add_node("extract_analysis", extract_analysis)
 
-    # Define sequential flow
-    graph.set_entry_point("extract_requirements")
-    graph.add_edge("extract_requirements", "detect_stakeholders")
-    graph.add_edge("detect_stakeholders", "generate_user_stories")
-    graph.add_edge("generate_user_stories", "classify_priorities")
-    graph.add_edge("classify_priorities", "check_ambiguities")
-    graph.add_edge("check_ambiguities", "detect_missing")
-    graph.add_edge("detect_missing", "detect_conflicts")
-    graph.add_edge("detect_conflicts", "find_dependencies")
-    graph.add_edge("find_dependencies", "generate_summary")
-    graph.add_edge("generate_summary", "format_json")
-    graph.add_edge("format_json", END)
+    graph.add_node("validation_agent", validation_agent)
+    graph.add_node("validation_tools", ToolNode(VALIDATION_TOOLS))
+
+    graph.add_node("synthesis_agent", synthesis_agent)
+    graph.add_node("format_output", format_output)
+
+    # Edges
+    graph.set_entry_point("analysis_agent")
+    
+    # 1. Analysis phase
+    graph.add_edge("analysis_agent", "extract_analysis")
+    graph.add_edge("extract_analysis", "validation_agent")
+
+    # 2. Validation tool loop
+    graph.add_conditional_edges(
+        "validation_agent",
+        route_validation,
+        {
+            "validation_tools": "validation_tools",
+            "synthesis_agent": "synthesis_agent",
+        },
+    )
+    graph.add_edge("validation_tools", "validation_agent")
+
+    # 3. Synthesis phase
+    graph.add_edge("synthesis_agent", "format_output")
+    graph.add_edge("format_output", END)
 
     return graph.compile(checkpointer=_checkpointer)
 
-
-# Pre-compiled graph instance
+# Pre-compiled graph instance (imported by routes.py)
 analysis_pipeline = build_analysis_graph()
